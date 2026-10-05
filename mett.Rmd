@@ -564,24 +564,27 @@ plot_gene_dmrs(PID_gene_names,    "PID",    "metilasyon/PID_All_Genes_Plots.pdf"
 plot_gene_dmrs(PIDCAN_gene_names, "PIDCAN", "metilasyon/PIDCAN_All_Genes_Plots.pdf")
 ```
 
-
 ```{r}
-# We isolated the specific sibling pair cases ("MP11" and "MP12") by retrieving their unique array barcode identifiers (prefixes) from the metadata, ensuring both samples were successfully matched and present in the filtered beta matrix. Subsequently, we defined an unrelated control cohort by selecting all samples designated under the control group ("C") while explicitly excluding the sibling identifiers to prevent confounding in downstream familial and comparative methylation analyses.
+# We identified the sibling pair ("MP11" and "MP12") by their array barcode prefixes and verified that both samples passed QC and are present in the final beta matrix. We defined the control cohort as all control-group ("C") samples excluding the siblings, and confirmed that every control is present in the beta matrix. Sibling labels and plotting colors were also assigned here.
 
 sib_names  <- c("MP11", "MP12")
-sib_prefix <- targets_qc$prefix[targets_qc$Sample_Name %in% sib_names]
-stopifnot(length(sib_prefix) == 2)
+sib_prefix <- targets_qc$prefix[match(sib_names, targets_qc$Sample_Name)]   # keeps MP11, MP12 order
+stopifnot(!anyNA(sib_prefix))
 stopifnot(all(sib_prefix %in% colnames(beta_final)))
-print(sib_prefix)   # should give "207700160059_R04C01" "207700160059_R05C01"
+print(sib_prefix)   # expected: "207700160059_R04C01" "207700160059_R05C01"
 
 ctrl_prefix <- targets_qc$prefix[targets_qc$Sample_Group == "C" &
                                  !(targets_qc$prefix %in% sib_prefix)]
-print(length(ctrl_prefix))
+stopifnot(all(ctrl_prefix %in% colnames(beta_final)))
+message("Number of unrelated controls: ", length(ctrl_prefix))
+
+sib_labels <- sib_names
+sib_cols   <- setNames(c("#e34a33", "#fdae61"), sib_labels)
 ```
 
 
 ```{r}
-# We extracted genomic annotations from the Illumina EPICv2 manifest (hg38), subsetting quality-filtered probes and expanding multi-gene mappings to build a distinct probe-to-gene lookup table. We then developed a comparative profiling function (sibling_compare) to evaluate methylation differences between the sibling pair against baseline control metrics. For each candidate gene set, the function calculates pairwise sibling beta differences (delta),establishes control cohort distribution parameters (mean, SD, min, max), flags probes deviating beyond control boundaries or exceeding a predefined effect-size threshold (|delta| >= 0.2),integrates functional genomic context (CpG island relations and gene regions), and aggregates gene-level metrics into a structured multi-sheet Excel report.
+# We extracted genomic annotations from the Illumina EPICv2 manifest (hg38) for all quality-filtered probes. Multi-gene probe annotations were expanded so that each row represents one probe-gene pair, and probes without a gene annotation were dropped. We also prepared a per-probe annotation table (chromosome, position, gene region, CpG island relation) to be joined with the results.
 
 ann <- as.data.frame(getAnnotation(IlluminaHumanMethylationEPICv2anno.20a1.hg38))
 ann <- ann[rownames(beta_final), c("chr", "pos", "UCSC_RefGene_Name",
@@ -592,11 +595,28 @@ probe_gene <- data.frame(
   probe = rep(rownames(ann), lengths(gene_list)),
   gene  = unlist(gene_list),
   stringsAsFactors = FALSE
-) %>% dplyr::distinct()
+) %>%
+  dplyr::filter(!is.na(gene), gene != "") %>%
+  dplyr::distinct()
 
-sibling_compare <- function(gene_names, label, out_xlsx, delta_cut = 0.2) {
-  genes <- toupper(trimws(gene_names))
+ann_tbl <- data.frame(
+  probe              = rownames(ann),
+  chr                = ann$chr,
+  pos                = ann$pos,
+  UCSC_RefGene_Group = ann$UCSC_RefGene_Group,
+  Relation_to_Island = ann$Relation_to_Island,
+  stringsAsFactors   = FALSE
+)
+```
+
+
+```{r}
+# We defined a function (sibling_compare) that profiles the methylation difference between the two siblings for every gene in a candidate panel, without applying any effect-size cutoff to remove genes. For each CpG it computes the sibling beta difference (delta), the control mean, SD, minimum and maximum, the distance of each sibling from the control mean, and whether each sibling falls outside the control range. CpG-level results are then summarised per gene, including the control values, and all genes are ranked by their mean absolute sibling difference. Panel genes without any usable CpG are reported separately. Results are exported to a multi-sheet Excel file.
+
+sibling_compare <- function(gene_names, label, out_xlsx) {
+  genes <- unique(toupper(trimws(gene_names)))
   pg <- probe_gene %>% dplyr::filter(toupper(gene) %in% genes)
+  if (nrow(pg) == 0) stop(label, ": none of the panel genes were found in the annotation")
 
   b   <- beta_final[unique(pg$probe), , drop = FALSE]
   ctl <- b[, ctrl_prefix, drop = FALSE]
@@ -608,85 +628,163 @@ sibling_compare <- function(gene_names, label, out_xlsx, delta_cut = 0.2) {
     ctrl_mean = rowMeans(ctl),
     ctrl_sd   = apply(ctl, 1, sd),
     ctrl_min  = apply(ctl, 1, min),
-    ctrl_max  = apply(ctl, 1, max)
+    ctrl_max  = apply(ctl, 1, max),
+    row.names = NULL
   )
-  res$delta     <- res$sib1 - res$sib2
-  res$abs_delta <- abs(res$delta)
+  res$delta           <- res$sib1 - res$sib2
+  res$abs_delta       <- abs(res$delta)
+  res$ctrl_range      <- res$ctrl_max - res$ctrl_min
+  res$sib1_minus_ctrl <- res$sib1 - res$ctrl_mean
+  res$sib2_minus_ctrl <- res$sib2 - res$ctrl_mean
   res$sib1_outside_ctrl <- res$sib1 < res$ctrl_min | res$sib1 > res$ctrl_max
   res$sib2_outside_ctrl <- res$sib2 < res$ctrl_min | res$sib2 > res$ctrl_max
-  res$flag <- res$abs_delta >= delta_cut
 
-  res <- pg %>%
+  detail <- pg %>%
     dplyr::inner_join(res, by = "probe") %>%
-    dplyr::left_join(
-      data.frame(probe = rownames(ann),
-                 ann[, c("chr", "pos", "UCSC_RefGene_Group", "Relation_to_Island")]),
-      by = "probe") %>%
+    dplyr::left_join(ann_tbl, by = "probe") %>%
     dplyr::arrange(gene, chr, pos)
 
-  summ <- res %>%
+  summ <- detail %>%
     dplyr::group_by(gene) %>%
-    dplyr::summarise(n_cpg = dplyr::n(),
-                     n_flag = sum(flag),
-                     mean_delta = mean(delta),
-                     max_abs_delta = max(abs_delta),
-                     .groups = "drop") %>%
-    dplyr::arrange(dplyr::desc(max_abs_delta))
+    dplyr::summarise(
+      n_cpg            = dplyr::n(),
+      # siblings
+      sib1_mean        = mean(sib1),
+      sib2_mean        = mean(sib2),
+      mean_abs_delta   = mean(abs_delta),
+      max_abs_delta    = max(abs_delta),
+      n_delta_ge_0.1   = sum(abs_delta >= 0.1),
+      n_delta_ge_0.2   = sum(abs_delta >= 0.2),
+      # controls
+      ctrl_mean_gene   = mean(ctrl_mean),
+      ctrl_mean_range  = mean(ctrl_range),
+      # siblings relative to controls
+      sib1_dist_ctrl   = mean(abs(sib1_minus_ctrl)),
+      sib2_dist_ctrl   = mean(abs(sib2_minus_ctrl)),
+      n_sib1_outside   = sum(sib1_outside_ctrl),
+      n_sib2_outside   = sum(sib2_outside_ctrl),
+      .groups = "drop"
+    ) %>%
+    dplyr::mutate(delta_to_ctrl_range = mean_abs_delta / ctrl_mean_range) %>%
+    dplyr::arrange(dplyr::desc(mean_abs_delta)) %>%
+    dplyr::mutate(dplyr::across(where(is.numeric) & !dplyr::starts_with("n_"),
+                                ~ round(.x, 3)))
 
-  write_xlsx(list(gene_summary = summ, cpg_detail = res), path = out_xlsx)
-  message(label, ": ", nrow(res), " CpGs, ", length(unique(res$gene)), " genes, ",
-          sum(res$flag), " CpGs with |delta| >= ", delta_cut)
-  invisible(list(summary = summ, detail = res))
+  genes_no_data <- data.frame(
+    gene = setdiff(genes, toupper(summ$gene))
+  )
+
+  legend <- data.frame(
+    column = c("sib1 / sib2", "delta", "mean_abs_delta", "ctrl_mean_gene",
+               "ctrl_mean_range", "delta_to_ctrl_range",
+               "sib1_dist_ctrl / sib2_dist_ctrl", "n_sib*_outside"),
+    meaning = c(
+      paste0("Beta values of ", sib_labels[1], " / ", sib_labels[2]),
+      "Sibling difference (sib1 - sib2)",
+      "Mean absolute sibling difference over the gene's CpGs (main ranking metric)",
+      "Mean of the control means over the gene's CpGs",
+      paste0("Mean (max - min) among ", length(ctrl_prefix), " controls over the gene's CpGs"),
+      "mean_abs_delta / ctrl_mean_range: sibling difference relative to control spread",
+      "Mean absolute distance of each sibling from the control mean",
+      "Number of CpGs where the sibling lies outside the control min-max range"
+    )
+  )
+
+  write_xlsx(list(gene_summary  = summ,
+                  cpg_detail    = detail,
+                  genes_no_data = genes_no_data,
+                  legend        = legend),
+             path = out_xlsx)
+
+  message(label, ": ", nrow(detail), " CpGs, ", nrow(summ), " genes with data, ",
+          nrow(genes_no_data), " panel genes without any CpG")
+  invisible(list(summary = summ, detail = detail, no_data = genes_no_data))
 }
 ```
 
 
 ```{r}
-# We performed intra-sibling and control-benchmarked methylation profiling across CVID, PID,and PIDCAN gene sets, saving the resulting probe-level differences and gene summaries into separate Excel files for each disease panel.
+# We ran the sibling comparison for the CVID, PID and PIDCAN gene panels. Each run writes a separate Excel file with the gene-level summary (including control values), the CpG-level details, the panel genes with no usable CpG, and a column legend.
 
-cvid_sib   <- sibling_compare(cvid_gene_names,   "CVID",   "metilasyon/sibling_CVID.xlsx")
-pid_sib    <- sibling_compare(PID_gene_names,    "PID",    "metilasyon/sibling_PID.xlsx")
-pidcan_sib <- sibling_compare(PIDCAN_gene_names, "PIDCAN", "metilasyon/sibling_PIDCAN.xlsx")
-``` 
+cvid_sib   <- sibling_compare(cvid_gene_names,   "CVID",   "metilasyon/sibling_CVID_full.xlsx")
+pid_sib    <- sibling_compare(PID_gene_names,    "PID",    "metilasyon/sibling_PID_full.xlsx")
+pidcan_sib <- sibling_compare(PIDCAN_gene_names, "PIDCAN", "metilasyon/sibling_PIDCAN_full.xlsx")
+
+# quick look at the top genes
+head(cvid_sib$summary, 10)
+```
+
 
 ```{r}
-# We assigned sibling-specific identifiers and distinct color codes ("#e34a33" and "#fdae61"),then established an automated visualization pipeline (plot_sibling) using ggplot2 to profilelocus-specific methylation patterns across prioritized candidate genes. By default, the function isolates genes harboring discordant CpG sites (|delta| >= 0.2), orders probes by genomic position,and depicts control cohort reference intervals as shaded ribbons (min–max) alongside control mean trajectories. Sibling beta values are overlaid as discrete points to clearly visualize intra-pair divergence and baseline control departures. We subsequently executed this plotting routine across the CVID, PID, and PIDCAN comparative results, exporting each panel's multi-gene loci into dedicated PDF reports.
+# We visualised the genes with the largest sibling difference. Bars show the mean absolute sibling difference per gene, and black diamonds show the average control spread (max - min) for the same gene, so the sibling difference can be judged against normal variation among controls.
 
-sib_labels <- targets_qc$Sample_Name[match(sib_prefix, targets_qc$prefix)]
-sib_cols   <- setNames(c("#e34a33", "#fdae61"), sib_labels)
+plot_top_genes <- function(summ, label, n = 30, pdf_file = NULL) {
+  top <- summ %>%
+    dplyr::slice_head(n = n) %>%
+    dplyr::mutate(gene = factor(gene, levels = rev(gene)))
 
-plot_sibling <- function(sib_obj, label, pdf_file, only_flag = TRUE) {
-  det <- sib_obj$detail
-  genes <- if (only_flag) unique(det$gene[det$flag]) else unique(det$gene)
-  if (length(genes) == 0) { message(label, ": no genes to plot"); return(invisible()) }
+  p <- ggplot(top, aes(y = gene)) +
+    geom_col(aes(x = mean_abs_delta), fill = "#e34a33", width = 0.7) +
+    geom_point(aes(x = ctrl_mean_range), shape = 18, size = 3.5, colour = "black") +
+    theme_bw() +
+    labs(title = paste0(label, ": top ", nrow(top), " genes by sibling difference"),
+         subtitle = paste0("Bars: mean |delta beta| (", sib_labels[1], " vs ", sib_labels[2],
+                           "); diamonds: mean control range (max - min)"),
+         x = "Beta difference / range", y = NULL)
+
+  if (!is.null(pdf_file)) ggsave(pdf_file, p, width = 8, height = 0.25 * nrow(top) + 2)
+  p
+}
+
+plot_top_genes(cvid_sib$summary,   "CVID",   pdf_file = "metilasyon/sibling_CVID_top_genes.pdf")
+plot_top_genes(pid_sib$summary,    "PID",    pdf_file = "metilasyon/sibling_PID_top_genes.pdf")
+plot_top_genes(pidcan_sib$summary, "PIDCAN", pdf_file = "metilasyon/sibling_PIDCAN_top_genes.pdf")
+```
+
+
+```{r}
+
+# We plotted CpG-level methylation along each gene, ordered by genomic position. The grey band marks the control min-max range, the black line the control mean, and the colored points the two siblings. Genes are ordered by their mean absolute sibling difference, and by default the top 30 genes per panel are drawn (set top_n = NULL to plot every gene). Genes with a single CpG show the control range as an error bar.
+
+plot_sibling <- function(sib_obj, label, pdf_file, top_n = 30) {
+  det   <- sib_obj$detail
+  summ  <- sib_obj$summary
+  genes <- summ$gene
+  if (!is.null(top_n)) genes <- head(genes, top_n)
 
   pdf(pdf_file, width = 9, height = 5)
   on.exit(dev.off())
   for (g in genes) {
-    d <- det %>% dplyr::filter(gene == g) %>% dplyr::arrange(pos)
-    d <- d %>% dplyr::mutate(cpg = factor(probe, levels = unique(probe))) 
+    s <- summ[summ$gene == g, ]
+    d <- det %>%
+      dplyr::filter(gene == g) %>%
+      dplyr::arrange(pos) %>%
+      dplyr::mutate(cpg = factor(probe, levels = unique(probe)))
+
     long <- d %>%
       tidyr::pivot_longer(c(sib1, sib2), names_to = "who", values_to = "beta") %>%
       dplyr::mutate(who = ifelse(who == "sib1", sib_labels[1], sib_labels[2]))
 
     p <- ggplot(d, aes(x = cpg, group = 1)) +
       geom_ribbon(aes(ymin = ctrl_min, ymax = ctrl_max), fill = "grey80", alpha = 0.8) +
+      geom_errorbar(aes(ymin = ctrl_min, ymax = ctrl_max), width = 0.3, colour = "grey60") +
       geom_line(aes(y = ctrl_mean), colour = "black", linewidth = 0.6) +
+      geom_point(aes(y = ctrl_mean), colour = "black", size = 1.2) +
       geom_point(data = long, aes(y = beta, colour = who), size = 3) +
       scale_colour_manual(values = sib_cols, name = "Sibling") +
       coord_cartesian(ylim = c(0, 1)) +
       theme_bw() +
       theme(axis.text.x = element_text(angle = 60, hjust = 1, size = 6)) +
       labs(title = paste0(label, " - ", g),
-           subtitle = "Grey band: control min-max, black line: control mean",
+           subtitle = sprintf("mean |delta| = %.3f | mean control range = %.3f | n CpG = %d   (grey band: control min-max, black line: control mean)",
+                              s$mean_abs_delta, s$ctrl_mean_range, s$n_cpg),
            x = "CpG (genomic order)", y = "Beta")
     print(p)
   }
   message(label, ": ", length(genes), " genes plotted -> ", pdf_file)
 }
 
-plot_sibling(cvid_sib,   "CVID",   "metilasyon/sibling_CVID_plots.pdf")
-plot_sibling(pid_sib,    "PID",    "metilasyon/sibling_PID_plots.pdf")
-plot_sibling(pidcan_sib, "PIDCAN", "metilasyon/sibling_PIDCAN_plots.pdf")
+plot_sibling(cvid_sib,   "CVID",   "metilasyon/sibling_CVID_top_plots.pdf")
+plot_sibling(pid_sib,    "PID",    "metilasyon/sibling_PID_top_plots.pdf")
+plot_sibling(pidcan_sib, "PIDCAN", "metilasyon/sibling_PIDCAN_top_plots.pdf")
 ```
-
