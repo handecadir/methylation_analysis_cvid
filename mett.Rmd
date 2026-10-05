@@ -1,0 +1,692 @@
+---
+title: "CVID-PID-PIDCAN"
+output: html_document
+date: "2026-02-16"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+# --- METHYLATION & BIOINFORMATICS ANALYSIS LIBRARIES ---
+
+# We used sesame for DNA methylation data preprocessing, quality control, and normalization
+library(sesame)
+
+# We used DMRcate to detect differentially methylated regions (DMRs)
+library(DMRcate)
+
+# We used limma to fit linear models for differential methylation analysis (DMPs)
+library(limma)
+
+# We used GenomicRanges to manage and manipulate genomic intervals and coordinates
+library(GenomicRanges)
+
+# We used GEOquery to retrieve raw methylation datasets and series from NCBI GEO
+library(GEOquery)
+
+# We used this annotation package to map probes to the Illumina EPICv2 manifest on hg38
+library(IlluminaHumanMethylationEPICv2anno.20a1.hg38)
+
+
+# --- DATA WRANGLING & MANAGEMENT ---
+
+# We used tidyverse for consistent data manipulation and analysis workflows
+library(tidyverse)
+
+# We used data.table for high-performance processing and filtering of large matrices
+library(data.table)
+
+
+# We used writexl to export our analysis results directly into Excel format
+library(writexl)
+
+
+# --- DATA VISUALIZATION & PLOTTING ---
+
+# We used ggplot2 to create core statistical and exploratory plots
+library(ggplot2)
+
+# We used Gviz to visualize methylation tracks along genomic coordinates
+library(Gviz)
+
+# We used RColorBrewer to apply publication-ready color palettes
+library(RColorBrewer)
+
+# We used ggthemes to apply tailored styling and visual themes to our plots
+library(ggthemes)
+
+# We used ggrepel to prevent overlapping labels in volcano and scatter plots
+library(ggrepel)
+
+# We used patchwork to assemble and arrange multiple plots into unified panels
+library(patchwork)
+
+library(AnnotationHub)
+```
+
+```{r}
+# We loaded the sample metadata from the CSV file into a data frame
+targets <- read.csv("metilasyon/SampleSheet.csv", stringsAsFactors = FALSE)
+
+# We created the IDAT file prefix by concatenating the Sentrix ID and Sentrix Position
+targets$prefix <- paste0(targets$Sentrix_ID, "_", targets$Sentrix_Position)
+```
+
+```{r}
+# We downloaded and cached the required reference datasets for the sesame package locally
+sesameDataCache()
+```
+
+```{r}
+# We searched and indexed all IDAT file prefixes found in the methylation data directory
+idats <- searchIDATprefixes("metilasyon/")
+```
+
+```{r}
+# We preprocessed the raw IDAT files using the 'CDB' pipeline and extracted the beta values
+beta_v2 <- openSesame(idats, prep = "CDB", func = getBetas)
+
+# We aligned the order of the beta matrix columns to match the sample metadata prefixes exactly
+beta_v2 <- beta_v2[, match(targets$prefix, colnames(beta_v2))]
+```
+
+```{r}
+# We loaded raw SigDF objects without applying any preprocessing steps
+sdfs <- openSesame(idats, prep = "", func = NULL)
+
+# We generated a SNP heatmap across all samples to check for sample identity and potential swaps
+sesameQC_plotHeatSNPs(sdfs)
+```
+
+```{r}
+# In this quality control step, we evaluated probe reliability across our dataset by calculating detection p-values using the pOOBAH method. We masked low-confidence signal measurements by replacing p-values above 0.05 with NA, aligned the columns with our sample metadata, and identified low-quality probes that failed detection in more than 20% of the samples to flag them for filtering.
+
+pvals <- openSesame(idats, func = pOOBAH, return.pval = TRUE)
+pvals[pvals > 0.05] <- NA
+
+pvals <- pvals[, match(targets$prefix, colnames(pvals))]
+
+row_Ps <- apply(pvals, 1, function(x) {
+  sum(is.na(x))
+})
+
+probes_to_remove20 <- which(row_Ps > ((ncol(pvals) / 100) * 20))
+print(
+  paste(
+    length(probes_to_remove20),
+    "Probes failed by each having a detection P value > 0.05 in more than 20% of samples",
+    sep = " "
+  )
+)
+```
+
+```{r}
+# We filtered out the low-quality probes that failed detection in more than 20% of the samples from both our beta value and p-value matrices. For the retained probes, we further masked any individual unreliable measurements by setting the corresponding beta values to NA wherever the detection p-value was not significant.
+
+keep_probes <- !(rownames(beta_v2) %in% names(probes_to_remove20))
+beta_v2.detP <- beta_v2[keep_probes, ]
+pvals2 <- pvals[rownames(beta_v2.detP), ]   # satır adına göre eşleşir
+beta_v2.detP[is.na(pvals2)] <- NA
+```
+
+```{r}
+# We performed sample-level quality control by calculating the number of failed probes per sample across the filtered dataset. We retained only the samples where fewer than 10% of total probes failed detection (p-value > 0.05), reported the count of samples that passed QC, and filtered our sample metadata table accordingly.
+
+detec <- apply(pvals2, 2, function(x) {
+  sum(is.na(x))
+})
+
+keep_samples <- which(detec < nrow(pvals2) * 0.10)
+print(
+  paste(
+    length(keep_samples),
+    "samples passed QC by each having fewer than 10% of all probes fail detection P value (>0.05)",
+    sep = " "
+  )
+)
+targets_qc <- targets[keep_samples, ]
+```
+
+```{r}
+# We subset the beta value matrix to retain only the high-quality samples that successfully passed our sample-level detection p-value QC threshold.
+
+beta_v2.detP2 <- beta_v2.detP[, keep_samples]
+```
+
+```{r}
+# We removed probes overlapping known single nucleotide polymorphisms (SNPs)and non-CpG (CH) sites using DMRcate to eliminate confounding genetic variation and focus exclusively on reliable CpG methylation signals.
+
+beta_v2.clean <- rmSNPandCH(beta_v2.detP2)
+```
+
+```{r}
+# We removed probes containing missing values across samples and eliminated any invalid or unannotated probe IDs from the row names. Finally, we converted the cleaned beta values into M-values to provide a more suitable, homoscedastic distribution for downstream statistical modeling and differential analysis.
+
+beta_final <- beta_v2.clean[complete.cases(beta_v2.clean), ]
+
+beta_final <- beta_final[!is.na(rownames(beta_final)) & rownames(beta_final) != "NA", ]
+
+M_final <- BetaValueToMValue(beta_final)
+
+```
+
+```{r}
+# We converted the experimental group variable into a factor and constructed a design matrix to model the differential contrast. Using DMRcate's cpg.annotate function, we annotated CpG sites across the EPICv2 array, evaluating differential methylation on the M-value matrix based on the group comparison (coef = 2) and collapsing duplicated EPICv2 probe measurements using the mean filter.
+
+targets_qc$Sample_Group <- as.factor(targets_qc$Sample_Group)
+design <- model.matrix(~ targets_qc$Sample_Group)
+
+myannotation <- cpg.annotate(
+  datatype = "array",
+  object = M_final,            
+  what = "M",
+  arraytype = "EPICv2",
+  analysis.type = "differential",
+  design = design,
+  coef = 2,
+  epicv2Filter = "mean"
+)
+```
+
+
+```{r}
+# We identified probes containing missing values (NAs) across samples within our filtered beta matrix and displayed their identifiers. We then queried the Illumina EPICv2 annotation manifest to retrieve and inspect the genomic coordinates (chromosome, position) and associated UCSC gene symbols for these problematic probes.
+
+problematic_probes <- rownames(beta_v2.detP2)[rowSums(is.na(beta_v2.detP2)) > 0]
+
+print("Problematic probe(s) containing NA:")
+print(problematic_probes)
+annotation_map <- getAnnotation(IlluminaHumanMethylationEPICv2anno.20a1.hg38)
+problematic_probe_info <- annotation_map[problematic_probes, c("chr", "pos", "UCSC_RefGene_Name")]
+print(problematic_probe_info)
+```
+
+```{r}
+# We updated the false discovery rate (FDR) threshold in our DMRcate annotation object to 0.05 to filter for statistically significant differentially methylated CpG sites.
+
+myannotation <- changeFDR(myannotation, 0.05)
+```
+
+```{r}
+# We applied the DMRcate algorithm to identify differentially methylated regions(DMRs) by clustering significant CpGs using Gaussian kernel smoothing. We then extracted the identified DMRs as a GRanges object mapped to the hg38 genome assembly and determined the total number of significant regions.
+
+dmrcoutput <- dmrcate(myannotation)
+results.ranges <- extractRanges(dmrcoutput = dmrcoutput, genome = "hg38")
+length(results.ranges)
+```
+
+```{r}
+# We converted the extracted GRanges object containing differentially methylated regions into a standard R data frame for easier data manipulation, downstream filtering and tabular export.
+
+results.df <- as.data.frame(results.ranges)
+```
+
+
+```{r}
+# We imported the CVID-associated gene list from a CSV file, extracted the gene names, and cleaned any empty or missing entries. Using regular expressions with word boundaries, we filtered our DMR results table to retain regions overlapping specifically with these target CVID genes, inspected the filtered dataset and exported the final results to an Excel spreadsheet.
+
+cvid_data <- read.csv("metilasyon/CVID.csv")
+cvid_gene_names <- cvid_data$Gene
+
+cvid_gene_names <- cvid_gene_names[!is.na(cvid_gene_names) & cvid_gene_names != ""]
+
+cvid_DMR_results <- results.df %>%
+  dplyr::filter(str_detect(overlapping.genes,
+                           regex(paste0("\\b(", paste(cvid_gene_names, collapse = "|"), ")\\b"),
+                                 ignore_case = TRUE)))
+
+View(cvid_DMR_results)
+
+write_xlsx(cvid_DMR_results, path = "metilasyon/cvid_DMR_result.xlsx")
+```
+
+
+```{r}
+# We imported the primary immunodeficiency (PID)-associated gene list from a CSV file extracted the gene names, and cleaned any empty or missing entries. Using regular expressions with word boundaries, we filtered our DMR results table to retain regions overlapping specifically with these target PID genes, inspected the filtered dataset, and exported the final results to an Excel spreadsheet.
+
+PID_data <- read.csv("metilasyon/PID.csv")
+
+PID_gene_names <- PID_data$Gene
+
+PID_gene_names <- PID_gene_names[!is.na(PID_gene_names) & PID_gene_names != ""]
+
+PID_DMR_results <- results.df %>%
+  dplyr::filter(str_detect(overlapping.genes,
+                           regex(paste0("\\b(", paste(PID_gene_names, collapse = "|"), ")\\b"),
+                                 ignore_case = TRUE)))
+
+View(PID_DMR_results)
+
+write_xlsx(PID_DMR_results, path = "metilasyon/pid_DMR_results.xlsx")
+```
+
+```{r}
+# We imported the primary immunodeficiency (PID)candidate gene list from a CSV file, extracted the gene names, and cleaned any empty or missing entries. Using regular expressions with word boundaries, we filtered our DMR results table to retain regions overlapping specifically with these target PIDCAN genes, inspected the filtered dataset, and exported the final results to an Excel spreadsheet.
+
+PIDCAN_data <- read.csv("metilasyon/PIDCAN.csv")
+PIDCAN_gene_names <- PIDCAN_data$Gene
+PIDCAN_gene_names <- PIDCAN_gene_names[!is.na(PIDCAN_gene_names) & PIDCAN_gene_names != ""]
+
+PIDCAN_DMR_results <- results.df %>%
+  dplyr::filter(str_detect(overlapping.genes,
+                           regex(paste0("\\b(", paste(PIDCAN_gene_names, collapse = "|"), ")\\b"),
+                                 ignore_case = TRUE)))
+
+View(PIDCAN_DMR_results)
+write_xlsx(PIDCAN_DMR_results, path = "metilasyon/pidcan_DMR_result.xlsx")
+```
+
+```{r}
+# We reshaped the filtered beta value matrix into a long-format data table and mapped sample group metadata to each observation. We then generated two density distribution plots to evaluate methylation profiles—one stratified by experimental groups using custom colors and another showing individual sample distributions—and combined both figures into a single vertically aligned panel using patchwork.
+
+dt_beta <- as.data.table(beta_final, keep.rownames = "Probe")
+x <- melt(dt_beta, id.vars = "Probe", variable.name = "Sample", value.name = "Beta")
+
+
+x$Group <- targets_qc$Sample_Group[match(x$Sample, targets_qc$prefix)]
+
+my_colors <- c("C" = "#2b8cbe", "P" = "#e34a33")
+
+p1 <- ggplot(x, aes(x = Beta, color = Group)) +
+  geom_density(size = 1) +
+  theme_minimal() +
+  ylab("Density") +
+  xlab("Beta Value") +
+  scale_color_manual(values = my_colors) +
+  theme(legend.position = "bottom") +
+  ggtitle("Density Plot by Group Average")
+
+p2 <- ggplot(x, aes(x = Beta, color = Sample)) +
+  geom_density(alpha = 0.5, size = 0.5) + 
+  theme_minimal() +
+  ylab("Density") +
+  xlab("Beta Value") +
+  theme(legend.position = "bottom") + 
+  labs(color = "Samples") + 
+  guides(color = guide_legend(ncol = 5)) + 
+  ggtitle("Density Plot by Sample")
+
+p1 / p2
+```
+
+```{r}
+# We computed multi-dimensional scaling (MDS) coordinates across all cleaned probes using limma's plotMDS function and structured the output into a data frame. We mapped group annotations and sample names to the coordinates, then visualized sample clustering and separation across the first two dimensions using ggplot2 with non-overlapping labels provided by ggrepel.
+
+mds_data <- plotMDS(beta_final, top = nrow(beta_final), plot = FALSE)
+
+
+toplot <- data.frame(
+  Dim1 = mds_data$x,
+  Dim2 = mds_data$y,
+  Sample = colnames(beta_final)
+)
+
+toplot$Group <- targets_qc$Sample_Group[match(toplot$Sample, targets_qc$prefix)]
+
+toplot$Label <- targets_qc$Sample_Name[match(toplot$Sample, targets_qc$prefix)] 
+
+
+ggplot(toplot, aes(x = Dim1, y = Dim2, colour = Group)) +
+  geom_point(size = 4, alpha = 0.8) +
+  geom_text_repel(aes(label = Label), min.segment.length = 0, box.padding = 0.5) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    legend.position = "bottom"
+  ) +
+  scale_color_manual(values = my_colors) + 
+  xlab("Dimension 1") +
+  ylab("Dimension 2") +
+  ggtitle("MDS Plot - All Clean Probes")
+```
+
+```{r}
+# We retrieved the latest human Ensembl transcript/exon annotations (GRCh38/hg38) via AnnotationHub and converted chromosome naming conventions to UCSC style to ensure compatibility with downstream tools. We extracted exon-level genomic features (gene IDs, gene symbols, transcript IDs, and biotypes) and standardized them into a GRanges object formatted for Gviz visualization. Finally, we defined an adapted version of DMRcate's plotting function (DMR.plot2) tailored for hg38 and EPICv2 array data.This function constructs and renders genomic tracks—including an ideogram, genome axis,Ensembl gene models, individual CpG probe positions, DMR intervals, and phenotypic group methylation profiles (heatmaps and mean confidence intervals)—over specified DMR flanking regions.
+
+ah <- AnnotationHub()
+q  <- query(ah, c("EnsDb", "Homo sapiens"))
+
+tt  <- q$title
+tt  <- tt[grepl("^Ensembl [0-9]+ EnsDb for Homo sapiens$", tt)]
+ver <- as.integer(sub("^Ensembl ([0-9]+) .*", "\\1", tt))
+print(sort(ver, decreasing = TRUE)[1:5])    
+
+id  <- names(q)[q$title == tt[which.max(ver)]]
+edb <- ah[[id]]                              
+seqlevelsStyle(edb) <- "UCSC"
+
+ensembldb::ensemblVersion(edb)  
+
+ex <- ensembldb::exons(edb,
+        columns = c("gene_id", "gene_name", "tx_id", "exon_id", "tx_biotype"),
+        return.type = "GRanges")
+ex <- GenomeInfoDb::keepStandardChromosomes(ex, pruning.mode = "coarse")
+ens_gr <- ex
+mcols(ens_gr) <- S4Vectors::DataFrame(
+  feature    = ex$tx_biotype,
+  exon       = ex$exon_id,
+  transcript = ex$tx_id,
+  gene       = ex$gene_id,
+  symbol     = ex$gene_name)
+
+DMR.plot2 <- function (ranges, dmr, CpGs, what = c("Beta", "M"),
+    arraytype = c("EPICv2", "EPICv1", "450K"), phen.col,
+    genome = c("hg19", "hg38", "mm10"), labels = names(ranges),
+    flank = 5000, heatmap = TRUE, extra.ranges = NULL,
+    extra.title = names(extra.ranges))
+{
+    what <- match.arg(what)
+    arraytype <- match.arg(arraytype)
+    genome <- match.arg(genome)
+    if (genome != "hg38") stop("DMR.plot2 sadece hg38 icin yazildi.")
+    stopifnot(class(CpGs)[1] %in% c("CpGannotated", "matrix", "BSseq", "GenomicRatioSet"))
+    if (flank < 10 | flank > 10000) {
+        stop("Error: DMR flanking region needs to be between 10bp and 10000bp")
+    }
+    stopifnot(dmr %in% 1:length(ranges))
+    IDs <- unique(names(phen.col))
+    if (is(CpGs, "CpGannotated")) {
+        CpGs <- getCollapsedBetas(CpGs, ranges = ranges[dmr] + flank)
+        RSanno <- data.frame(chr = gsub(":.*", "", rownames(CpGs)),
+            pos = as.numeric(gsub(".*:", "", rownames(CpGs))))
+        RSanno <- RSanno[order(RSanno$chr, RSanno$pos), ]
+        cpgs.ranges <- GRanges(RSanno$chr, IRanges(RSanno$pos, RSanno$pos))
+        values(cpgs.ranges) <- CpGs
+        isbsseq <- FALSE
+    }
+    else if (is(CpGs, "matrix") | is(CpGs, "GenomicRatioSet")) {
+        if (is(CpGs, "matrix")) {
+            if (arraytype == "450K") {
+                grset <- makeGenomicRatioSetFromMatrix(CpGs,
+                  array = "IlluminaHumanMethylation450k", annotation = "ilmn12.hg19",
+                  mergeManifest = TRUE, what = what)
+            }
+            if (arraytype == "EPICv1") {
+                grset <- makeGenomicRatioSetFromMatrix(CpGs,
+                  array = "IlluminaHumanMethylationEPIC", annotation = "ilm10b4.hg19",
+                  mergeManifest = TRUE, what = what)
+            }
+            if (arraytype == "EPICv2") {
+                grset <- makeGenomicRatioSetFromMatrix(CpGs,
+                  array = "IlluminaHumanMethylationEPICv2", annotation = "20a1.hg38",
+                  mergeManifest = TRUE, what = what)
+            }
+        }
+        else {
+            grset <- CpGs
+        }
+        CpGs <- getBeta(grset)
+        RSanno <- getAnnotation(grset)
+        RSanno <- RSanno[order(RSanno$chr, RSanno$pos), ]
+        CpGs <- CpGs[rownames(RSanno), ]
+        cpgs.ranges <- GRanges(RSanno$chr, IRanges(RSanno$pos, RSanno$pos))
+        values(cpgs.ranges) <- CpGs
+        isbsseq <- FALSE
+    }
+    else {
+        if (any(width(CpGs) > 1)) {
+            stop("Error: all ranges in the BSseq object must be single nucleotides with width 1.")
+        }
+        if (is.null(rownames(colData(CpGs)))) {
+            stop("Error: BSseq object must be annotated with colData with sample IDs as rownames of the data.frame.")
+        }
+        stopifnot(ncol(CpGs) == length(phen.col))
+        isbsseq <- TRUE
+    }
+    ranges$ID <- rep("", length(ranges))
+    ranges.reduce <- reduce(ranges + flank)
+    dmrs.inplot <- ranges[queryHits(findOverlaps(ranges, ranges.reduce[subjectHits(findOverlaps(ranges[dmr],
+        ranges.reduce))]))]
+    ranges.inplot <- ranges.reduce[queryHits(findOverlaps(ranges.reduce, dmrs.inplot))]
+    if (is(CpGs, "matrix")) {
+        cpgs.ranges <- subsetByOverlaps(cpgs.ranges, ranges.inplot)
+    }
+    else {
+        cpgs.ranges <- subsetByOverlaps(CpGs, ranges.inplot)
+    }
+    genome(cpgs.ranges) <- genome
+    if (isbsseq) {
+        methRatios <- GRanges(seqnames(cpgs.ranges), ranges(cpgs.ranges),
+            mcols = as.matrix(getCoverage(cpgs.ranges, type = "M"))/as.matrix(getCoverage(cpgs.ranges,
+                type = "Cov")))
+    }
+    else {
+        methRatios <- cpgs.ranges
+    }
+    values(methRatios) <- as.matrix(values(methRatios))
+    colnames(values(methRatios)) <- gsub("mcols.", "", colnames(values(methRatios)))
+    if (heatmap) {
+        dt.group <- lapply(unique(names(phen.col)), function(i) DataTrack(methRatios[,
+            names(phen.col) %in% i], name = i, background.title = phen.col[i],
+            type = "heatmap", showSampleNames = TRUE, ylim = c(0, 1),
+            genome = genome, gradient = colorRampPalette(c("black", "cyan"))(20)))
+    }
+    meanmeth <- DataTrack(methRatios, groups = names(phen.col),
+        type = c("a", "confint"), col = phen.col[sort(unique(names(phen.col)))],
+        ylim = c(0, 1), name = "Group means (with 0.3 CI)", na.rm = TRUE)
+    suppressMessages(setPar(meanmeth, "groupAnnotation", "feature"))
+    if (heatmap) {
+        dt.group <- c(dt.group, list(meanmeth))
+    }
+
+    suppressWarnings(
+      grt <- Gviz::GeneRegionTrack(ens_gr, genome = "hg38",
+               chromosome = as.character(seqnames(methRatios)[1]),
+               start = min(start(ranges.inplot)), end = max(end(ranges.inplot)),
+               name = "ENSEMBL"))
+
+    suppressMessages(grt <- setPar(grt, "collapseTranscripts", "meta"))
+    suppressMessages(grt <- setPar(grt, "exonAnnotation", "symbol"))
+    suppressMessages(grt <- setPar(grt, "fontcolor.item", "black"))
+    suppressMessages(grt <- setPar(grt, "cex", 0.6))
+    suppressMessages(grt <- setPar(grt, "rotation.item", 45))
+    suppressMessages(grt <- setPar(grt, "rotation.title", 0))
+    cpgs.track <- AnnotationTrack(GRanges(seqnames(cpgs.ranges), ranges(cpgs.ranges)),
+        name = "CpGs", fill = "green", stacking = "dense", rotation.title = 0)
+    suppressMessages(cpgs.track <- setPar(cpgs.track, "lty", "blank"))
+    if (all(is.null(names(dmrs.inplot)))) {
+        names(dmrs.inplot) <- rep("DMR", length(dmrs.inplot))
+    }
+    dmrs.track <- AnnotationTrack(dmrs.inplot, name = "DMRs", showFeatureId = TRUE,
+        fill = "purple", id = names(dmrs.inplot), fontcolor = "white", rotation.title = 0)
+    if (!is.null(extra.ranges)) {
+        extra.ranges <- extra.ranges[extra.ranges %over% dmrs.inplot]
+        extras.track <- AnnotationTrack(extra.ranges, showFeatureId = TRUE,
+            name = extra.title, fill = "pink", id = names(extra.ranges), rotation.title = 0)
+        basetracks <- list(IdeogramTrack(genome = genome, chromosome = as.character(seqnames(ranges.inplot))),
+            GenomeAxisTrack(), grt, cpgs.track, dmrs.track, extras.track)
+    }
+    else {
+        basetracks <- list(IdeogramTrack(genome = genome, chromosome = as.character(seqnames(ranges.inplot))),
+            GenomeAxisTrack(), grt, cpgs.track, dmrs.track)
+    }
+    if (heatmap) {
+        trackstoplot <- c(basetracks, dt.group)
+    }
+    else {
+        trackstoplot <- c(basetracks, meanmeth)
+    }
+    suppressWarnings(plotTracks(trackstoplot, from = min(start(ranges.inplot)),
+        to = max(end(ranges.inplot))))
+}
+environment(DMR.plot2) <- asNamespace("DMRcate")
+```
+
+
+```{r}
+# We verified sample identifier consistency between the final beta-value matrix and phenotype metadata, mapped group-specific color codes ("#e34a33" for Patient [P]and "#2b8cbe" for Control [C]), and replaced matrix column names with unique sample labels.We then implemented an automated batch-plotting wrapper function (plot_gene_dmrs)that searches for candidate genes within the DMR annotation table using exact regular expression matching. The function iterates over all identified DMR indices for each target gene, renders genomic tracks and methylation profiles using our custom DMR.plot2 function within a multi-page PDF device, adds custom genomic annotations via grid graphics, and handles runtime exceptions with robust error logging.
+
+stopifnot(all(colnames(beta_final) == targets_qc$prefix))
+
+my_group_colors <- character(ncol(beta_final))
+names(my_group_colors) <- as.character(targets_qc$Sample_Group)
+my_group_colors[targets_qc$Sample_Group == "P"] <- "#e34a33"   # Patients -> red
+my_group_colors[targets_qc$Sample_Group == "C"] <- "#2b8cbe"   # Controls -> blue
+
+print(unique(names(my_group_colors)))                  
+print(table(names(my_group_colors), my_group_colors))  
+
+beta_plot <- beta_final
+colnames(beta_plot) <- targets_qc$Sample_Name
+stopifnot(!anyDuplicated(colnames(beta_plot)))        
+
+plot_gene_dmrs <- function(gene_names, label, pdf_file) {
+  ok <- 0; errs <- character()
+  pdf(pdf_file, width = 10, height = 8)
+  on.exit(dev.off())
+  for (gene in gene_names) {
+    indices <- which(str_detect(results.df$overlapping.genes,
+                                regex(paste0("\\b", gene, "\\b"), ignore_case = TRUE)))
+    for (k in seq_along(indices)) {
+      res <- tryCatch({
+        suppressWarnings(DMR.plot2(ranges = results.ranges, dmr = indices[k],
+                                   CpGs = beta_plot, what = "Beta",
+                                   arraytype = "EPICv2", genome = "hg38",
+                                   phen.col = my_group_colors))
+        grid::grid.text(paste(label, "gene:", gene, "- Region:", k),
+                        x = 0.5, y = 0.985,
+                        gp = grid::gpar(col = "darkred", fontface = "bold"))
+        "ok"
+      }, error = function(e) conditionMessage(e))
+      if (res == "ok") ok <- ok + 1 else errs <- c(errs, res)
+    }
+  }
+  message(ok, " regions plotted, ", length(errs), " errors")
+  if (length(errs)) print(head(sort(table(errs), decreasing = TRUE), 5))
+}
+
+```
+
+```{r}
+# We executed batch genomic track visualizations for curated candidate gene panels associated with common CVID, PID,and PIDCAN. Using the automated plot_gene_dmrs pipeline, we queried each gene list against the annotated DMRs and exported all corresponding genomic locus plots—featuring group-level methylation profiles and Ensembl gene models—into dedicated multi-page PDF reports.
+plot_gene_dmrs(cvid_gene_names,   "CVID",   "metilasyon/CVID_All_Genes_Plots.pdf")
+plot_gene_dmrs(PID_gene_names,    "PID",    "metilasyon/PID_All_Genes_Plots.pdf")
+plot_gene_dmrs(PIDCAN_gene_names, "PIDCAN", "metilasyon/PIDCAN_All_Genes_Plots.pdf")
+```
+
+
+```{r}
+# We isolated the specific sibling pair cases ("MP11" and "MP12") by retrieving their unique array barcode identifiers (prefixes) from the metadata, ensuring both samples were successfully matched and present in the filtered beta matrix. Subsequently, we defined an unrelated control cohort by selecting all samples designated under the control group ("C") while explicitly excluding the sibling identifiers to prevent confounding in downstream familial and comparative methylation analyses.
+
+sib_names  <- c("MP11", "MP12")
+sib_prefix <- targets_qc$prefix[targets_qc$Sample_Name %in% sib_names]
+stopifnot(length(sib_prefix) == 2)
+stopifnot(all(sib_prefix %in% colnames(beta_final)))
+print(sib_prefix)   # should give "207700160059_R04C01" "207700160059_R05C01"
+
+ctrl_prefix <- targets_qc$prefix[targets_qc$Sample_Group == "C" &
+                                 !(targets_qc$prefix %in% sib_prefix)]
+print(length(ctrl_prefix))
+```
+
+
+```{r}
+# We extracted genomic annotations from the Illumina EPICv2 manifest (hg38), subsetting quality-filtered probes and expanding multi-gene mappings to build a distinct probe-to-gene lookup table. We then developed a comparative profiling function (sibling_compare) to evaluate methylation differences between the sibling pair against baseline control metrics. For each candidate gene set, the function calculates pairwise sibling beta differences (delta),establishes control cohort distribution parameters (mean, SD, min, max), flags probes deviating beyond control boundaries or exceeding a predefined effect-size threshold (|delta| >= 0.2),integrates functional genomic context (CpG island relations and gene regions), and aggregates gene-level metrics into a structured multi-sheet Excel report.
+
+ann <- as.data.frame(getAnnotation(IlluminaHumanMethylationEPICv2anno.20a1.hg38))
+ann <- ann[rownames(beta_final), c("chr", "pos", "UCSC_RefGene_Name",
+                                   "UCSC_RefGene_Group", "Relation_to_Island")]
+
+gene_list <- strsplit(ann$UCSC_RefGene_Name, ";")
+probe_gene <- data.frame(
+  probe = rep(rownames(ann), lengths(gene_list)),
+  gene  = unlist(gene_list),
+  stringsAsFactors = FALSE
+) %>% dplyr::distinct()
+
+sibling_compare <- function(gene_names, label, out_xlsx, delta_cut = 0.2) {
+  genes <- toupper(trimws(gene_names))
+  pg <- probe_gene %>% dplyr::filter(toupper(gene) %in% genes)
+
+  b   <- beta_final[unique(pg$probe), , drop = FALSE]
+  ctl <- b[, ctrl_prefix, drop = FALSE]
+
+  res <- data.frame(
+    probe     = rownames(b),
+    sib1      = b[, sib_prefix[1]],
+    sib2      = b[, sib_prefix[2]],
+    ctrl_mean = rowMeans(ctl),
+    ctrl_sd   = apply(ctl, 1, sd),
+    ctrl_min  = apply(ctl, 1, min),
+    ctrl_max  = apply(ctl, 1, max)
+  )
+  res$delta     <- res$sib1 - res$sib2
+  res$abs_delta <- abs(res$delta)
+  res$sib1_outside_ctrl <- res$sib1 < res$ctrl_min | res$sib1 > res$ctrl_max
+  res$sib2_outside_ctrl <- res$sib2 < res$ctrl_min | res$sib2 > res$ctrl_max
+  res$flag <- res$abs_delta >= delta_cut
+
+  res <- pg %>%
+    dplyr::inner_join(res, by = "probe") %>%
+    dplyr::left_join(
+      data.frame(probe = rownames(ann),
+                 ann[, c("chr", "pos", "UCSC_RefGene_Group", "Relation_to_Island")]),
+      by = "probe") %>%
+    dplyr::arrange(gene, chr, pos)
+
+  summ <- res %>%
+    dplyr::group_by(gene) %>%
+    dplyr::summarise(n_cpg = dplyr::n(),
+                     n_flag = sum(flag),
+                     mean_delta = mean(delta),
+                     max_abs_delta = max(abs_delta),
+                     .groups = "drop") %>%
+    dplyr::arrange(dplyr::desc(max_abs_delta))
+
+  write_xlsx(list(gene_summary = summ, cpg_detail = res), path = out_xlsx)
+  message(label, ": ", nrow(res), " CpGs, ", length(unique(res$gene)), " genes, ",
+          sum(res$flag), " CpGs with |delta| >= ", delta_cut)
+  invisible(list(summary = summ, detail = res))
+}
+```
+
+
+```{r}
+# We performed intra-sibling and control-benchmarked methylation profiling across CVID, PID,and PIDCAN gene sets, saving the resulting probe-level differences and gene summaries into separate Excel files for each disease panel.
+
+cvid_sib   <- sibling_compare(cvid_gene_names,   "CVID",   "metilasyon/sibling_CVID.xlsx")
+pid_sib    <- sibling_compare(PID_gene_names,    "PID",    "metilasyon/sibling_PID.xlsx")
+pidcan_sib <- sibling_compare(PIDCAN_gene_names, "PIDCAN", "metilasyon/sibling_PIDCAN.xlsx")
+``` 
+
+```{r}
+# We assigned sibling-specific identifiers and distinct color codes ("#e34a33" and "#fdae61"),then established an automated visualization pipeline (plot_sibling) using ggplot2 to profilelocus-specific methylation patterns across prioritized candidate genes. By default, the function isolates genes harboring discordant CpG sites (|delta| >= 0.2), orders probes by genomic position,and depicts control cohort reference intervals as shaded ribbons (min–max) alongside control mean trajectories. Sibling beta values are overlaid as discrete points to clearly visualize intra-pair divergence and baseline control departures. We subsequently executed this plotting routine across the CVID, PID, and PIDCAN comparative results, exporting each panel's multi-gene loci into dedicated PDF reports.
+
+sib_labels <- targets_qc$Sample_Name[match(sib_prefix, targets_qc$prefix)]
+sib_cols   <- setNames(c("#e34a33", "#fdae61"), sib_labels)
+
+plot_sibling <- function(sib_obj, label, pdf_file, only_flag = TRUE) {
+  det <- sib_obj$detail
+  genes <- if (only_flag) unique(det$gene[det$flag]) else unique(det$gene)
+  if (length(genes) == 0) { message(label, ": no genes to plot"); return(invisible()) }
+
+  pdf(pdf_file, width = 9, height = 5)
+  on.exit(dev.off())
+  for (g in genes) {
+    d <- det %>% dplyr::filter(gene == g) %>% dplyr::arrange(pos)
+    d <- d %>% dplyr::mutate(cpg = factor(probe, levels = unique(probe))) 
+    long <- d %>%
+      tidyr::pivot_longer(c(sib1, sib2), names_to = "who", values_to = "beta") %>%
+      dplyr::mutate(who = ifelse(who == "sib1", sib_labels[1], sib_labels[2]))
+
+    p <- ggplot(d, aes(x = cpg, group = 1)) +
+      geom_ribbon(aes(ymin = ctrl_min, ymax = ctrl_max), fill = "grey80", alpha = 0.8) +
+      geom_line(aes(y = ctrl_mean), colour = "black", linewidth = 0.6) +
+      geom_point(data = long, aes(y = beta, colour = who), size = 3) +
+      scale_colour_manual(values = sib_cols, name = "Sibling") +
+      coord_cartesian(ylim = c(0, 1)) +
+      theme_bw() +
+      theme(axis.text.x = element_text(angle = 60, hjust = 1, size = 6)) +
+      labs(title = paste0(label, " - ", g),
+           subtitle = "Grey band: control min-max, black line: control mean",
+           x = "CpG (genomic order)", y = "Beta")
+    print(p)
+  }
+  message(label, ": ", length(genes), " genes plotted -> ", pdf_file)
+}
+
+plot_sibling(cvid_sib,   "CVID",   "metilasyon/sibling_CVID_plots.pdf")
+plot_sibling(pid_sib,    "PID",    "metilasyon/sibling_PID_plots.pdf")
+plot_sibling(pidcan_sib, "PIDCAN", "metilasyon/sibling_PIDCAN_plots.pdf")
+```
+
