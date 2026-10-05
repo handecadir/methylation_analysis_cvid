@@ -743,7 +743,6 @@ plot_top_genes(pidcan_sib$summary, "PIDCAN", pdf_file = "metilasyon/sibling_PIDC
 
 
 ```{r}
-
 # We plotted CpG-level methylation along each gene, ordered by genomic position. The grey band marks the control min-max range, the black line the control mean, and the colored points the two siblings. Genes are ordered by their mean absolute sibling difference, and by default the top 30 genes per panel are drawn (set top_n = NULL to plot every gene). Genes with a single CpG show the control range as an error bar.
 
 plot_sibling <- function(sib_obj, label, pdf_file, top_n = 30) {
@@ -788,3 +787,4 @@ plot_sibling(cvid_sib,   "CVID",   "metilasyon/sibling_CVID_top_plots.pdf")
 plot_sibling(pid_sib,    "PID",    "metilasyon/sibling_PID_top_plots.pdf")
 plot_sibling(pidcan_sib, "PIDCAN", "metilasyon/sibling_PIDCAN_top_plots.pdf")
 ```
+
