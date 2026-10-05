@@ -218,13 +218,7 @@ Raw IDAT files, sample sheets and per-patient result tables are **not** included
 
 ## 👩‍🔬 Author
 
-**Hande Çadır**
-PhD project · İzmir, Türkiye
 
-<!-- Add: institution, supervisor, ethics approval number, funding, citation / DOI -->
 
 ---
 
-## 📄 License
-
-Add a license of your choice (e.g. MIT for the code) before making the repository public.
